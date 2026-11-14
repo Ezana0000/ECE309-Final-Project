@@ -81,6 +81,10 @@ private:
         Node*        right = nullptr;
     };
 
+    static void destroy(Node* node);
+    static std::size_t height_of(const Node* node);
+    static void in_order(const Node* node,
+                         const std::function<void(const MemoryRecord&)>& fn);
     Node*       root_ = nullptr;
     std::size_t count_ = 0;
 };

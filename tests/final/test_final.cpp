@@ -38,7 +38,12 @@
 #include "util/lru_cache.h"
 #include "util/min_heap.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdio>
+#include <random>
+#include <stdexcept>
 #include <memory>
 #include <string>
 #include <utility>
@@ -103,6 +108,427 @@ TEST(ctx_spec_example) {
     CHECK_EQ(p.keep, (std::vector<std::size_t>{0, 1, 4, 6, 7}));
     CHECK_EQ(p.total_tokens, std::size_t{50});
     CHECK(!p.over_budget);
+}
+
+TEST(heap_empty_throws) {
+    MinHeap<int> heap;
+
+    CHECK_THROWS(heap.top(), std::out_of_range);
+    CHECK_THROWS(heap.pop(), std::out_of_range);
+
+    heap.push(42);
+
+    CHECK_EQ(heap.top(), 42);
+    CHECK_EQ(heap.pop(), 42);
+    CHECK(heap.empty());
+
+    CHECK_THROWS(heap.pop(), std::out_of_range);
+}
+
+TEST(heap_top_k_edges) {
+    std::vector<int> values{5, 1, 9};
+
+    CHECK(top_k(values, 0).empty());
+
+    std::vector<int> expected{9, 5, 1};
+    CHECK_EQ(top_k(values, 10), expected);
+
+    std::vector<int> empty_values;
+    CHECK(top_k(empty_values, 3).empty());
+
+    // Compare top_k against a full sort with random data.
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<int> dist(-100000, 100000);
+
+    std::vector<int> random_values;
+
+    for (int i = 0; i < 1000; ++i) {
+        random_values.push_back(dist(rng));
+    }
+
+    std::vector<int> sorted = random_values;
+
+    std::sort(sorted.rbegin(), sorted.rend());
+    sorted.resize(10);
+
+    std::vector<int> result = top_k(random_values, 10);
+
+    CHECK_EQ(result, sorted);
+
+    // Performance comparison on 100,000 numbers.
+    std::vector<int> data;
+    data.reserve(100000);
+
+    for (int i = 0; i < 100000; ++i) {
+        data.push_back(dist(rng));
+    }
+
+    std::vector<int> sort_data = data;
+
+    auto start_heap = std::chrono::steady_clock::now();
+
+    std::vector<int> heap_result = top_k(data, 10);
+
+    auto end_heap = std::chrono::steady_clock::now();
+
+    auto start_sort = std::chrono::steady_clock::now();
+
+    std::sort(sort_data.rbegin(), sort_data.rend());
+
+    auto end_sort = std::chrono::steady_clock::now();
+
+    double heap_ms =
+        std::chrono::duration<double, std::milli>(
+            end_heap - start_heap
+        ).count();
+
+    double sort_ms =
+        std::chrono::duration<double, std::milli>(
+            end_sort - start_sort
+        ).count();
+
+    std::printf(
+        "top_k (100000 items, k=10): %.3f ms\n",
+        heap_ms
+    );
+
+    std::printf(
+        "std::sort (100000 items): %.3f ms\n",
+        sort_ms
+    );
+
+    REQUIRE(!heap_result.empty());
+    CHECK_EQ(heap_result.front(), sort_data.front());
+
+    std::vector<int> expected_top(
+        sort_data.begin(),
+        sort_data.begin() + 10
+    );
+
+    CHECK_EQ(heap_result, expected_top);
+}
+
+TEST(lru_get_refreshes_and_update) {
+    LruCache<std::string, int> cache(3);
+
+    cache.put("a", 1);
+    cache.put("b", 2);
+    cache.put("c", 3);
+
+    std::vector<std::string> initial{"c", "b", "a"};
+
+    CHECK_EQ(cache.keys_mru_to_lru(), initial);
+
+    // Accessing a moves it to the front.
+    int* value = cache.get("a");
+
+    REQUIRE(value != nullptr);
+    CHECK_EQ(*value, 1);
+
+    std::vector<std::string> after_get{"a", "c", "b"};
+
+    CHECK_EQ(cache.keys_mru_to_lru(), after_get);
+
+    // Updating an existing key should not evict anything.
+    cache.put("b", 20);
+
+    std::vector<std::string> after_update{"b", "a", "c"};
+
+    CHECK_EQ(cache.keys_mru_to_lru(), after_update);
+
+    int* updated = cache.get("b");
+
+    REQUIRE(updated != nullptr);
+    CHECK_EQ(*updated, 20);
+
+    CHECK_EQ(cache.size(), 3U);
+    CHECK_EQ(cache.stats().evictions, 0U);
+}
+
+TEST(lru_capacity_0_and_1) {
+    // A cache with capacity zero stores nothing.
+    LruCache<std::string, int> zero(0);
+
+    zero.put("a", 1);
+
+    CHECK_EQ(zero.size(), 0U);
+    CHECK(zero.get("a") == nullptr);
+    CHECK(zero.keys_mru_to_lru().empty());
+
+    // A cache with capacity one replaces its only entry.
+    LruCache<std::string, int> one(1);
+
+    one.put("a", 1);
+    CHECK(one.contains("a"));
+
+    one.put("b", 2);
+
+    CHECK(!one.contains("a"));
+    CHECK(one.contains("b"));
+    CHECK_EQ(one.size(), 1U);
+    CHECK_EQ(one.stats().evictions, 1U);
+
+    one.put("c", 3);
+
+    CHECK(!one.contains("b"));
+    CHECK(one.contains("c"));
+    CHECK_EQ(one.size(), 1U);
+    CHECK_EQ(one.stats().evictions, 2U);
+}
+
+TEST(lru_erase_head_middle_tail_stats) {
+    LruCache<std::string, int> cache(5);
+
+    cache.put("a", 1);
+    cache.put("b", 2);
+    cache.put("c", 3);
+    cache.put("d", 4);
+    cache.put("e", 5);
+
+    std::vector<std::string> initial{
+        "e", "d", "c", "b", "a"
+    };
+
+    CHECK_EQ(cache.keys_mru_to_lru(), initial);
+
+    // Remove the head.
+    CHECK(cache.erase("e"));
+
+    std::vector<std::string> after_head{
+        "d", "c", "b", "a"
+    };
+
+    CHECK_EQ(cache.keys_mru_to_lru(), after_head);
+
+    // Remove a middle node.
+    CHECK(cache.erase("c"));
+
+    std::vector<std::string> after_middle{
+        "d", "b", "a"
+    };
+
+    CHECK_EQ(cache.keys_mru_to_lru(), after_middle);
+
+    // Remove the tail.
+    CHECK(cache.erase("a"));
+
+    std::vector<std::string> after_tail{
+        "d", "b"
+    };
+
+    CHECK_EQ(cache.keys_mru_to_lru(), after_tail);
+
+    // Removing an absent key returns false.
+    CHECK(!cache.erase("zzz"));
+
+    CHECK_EQ(cache.size(), 2U);
+
+    // One hit and one miss.
+    int* hit = cache.get("d");
+
+    REQUIRE(hit != nullptr);
+    CHECK_EQ(*hit, 4);
+
+    CHECK(cache.get("x") == nullptr);
+
+    CHECK_EQ(cache.stats().hits, 1U);
+    CHECK_EQ(cache.stats().misses, 1U);
+
+    // Erasing keys does not count as eviction.
+    CHECK_EQ(cache.stats().evictions, 0U);
+
+    // Contains should not affect statistics.
+    CHECK(cache.contains("d"));
+    CHECK(!cache.contains("x"));
+
+    CHECK_EQ(cache.stats().hits, 1U);
+    CHECK_EQ(cache.stats().misses, 1U);
+    CHECK_EQ(cache.stats().evictions, 0U);
+}
+
+TEST(bst_remove_leaf_one_child_root_dup) {
+    MemoryIndex tree;
+
+    auto make_record = [](std::uint64_t id) {
+        MemoryRecord rec{};
+        rec.id = id;
+        return rec;
+    };
+
+    // tree im building:
+    //   50 has children 30 and 70
+    //   30 has children 20 and 40
+    //   70 only has a right child 80
+
+    CHECK(tree.insert(make_record(50)));
+    CHECK(tree.insert(make_record(30)));
+    CHECK(tree.insert(make_record(70)));
+    CHECK(tree.insert(make_record(20)));
+    CHECK(tree.insert(make_record(40)));
+    CHECK(tree.insert(make_record(80)));
+
+    CHECK_EQ(tree.size(), 6U);
+    CHECK_EQ(tree.height(), 3U);
+
+    // inserting the same id twice should fail
+    CHECK(!tree.insert(make_record(50)));
+    CHECK_EQ(tree.size(), 6U);
+
+    // remove a leaf
+    CHECK(tree.remove(20));
+
+    CHECK_EQ(tree.size(), 5U);
+    CHECK(tree.find(20) == nullptr);
+
+    // remove a node with one child
+    CHECK(tree.remove(70));
+
+    CHECK_EQ(tree.size(), 4U);
+    CHECK(tree.find(70) == nullptr);
+    CHECK(tree.find(80) != nullptr);
+
+    // remove the root, it has two children
+    CHECK(tree.remove(50));
+
+    CHECK_EQ(tree.size(), 3U);
+    CHECK(tree.find(50) == nullptr);
+
+    std::vector<std::uint64_t> ids;
+
+    tree.for_each_in_order(
+        [&](const MemoryRecord& rec) {
+            ids.push_back(rec.id);
+        }
+    );
+
+    std::vector<std::uint64_t> expected{
+        30, 40, 80
+    };
+
+    CHECK_EQ(ids, expected);
+
+    // removing a id thats not there shouldnt change anything
+    CHECK(!tree.remove(999));
+    CHECK_EQ(tree.size(), 3U);
+
+    // inserting in order makes the tree basically a linked list
+    MemoryIndex sequential;
+
+    for (std::uint64_t i = 1; i <= 1000; ++i) {
+        REQUIRE(sequential.insert(make_record(i)));
+    }
+
+    CHECK_EQ(sequential.size(), 1000U);
+    CHECK_EQ(sequential.height(), 1000U);
+
+    std::printf(
+        "BST sequential height (1000 nodes): %zu\n",
+        sequential.height()
+    );
+
+    // shuffled inserts should give a way shorter tree
+    std::vector<std::uint64_t> shuffled_ids;
+
+    for (std::uint64_t i = 1; i <= 1000; ++i) {
+        shuffled_ids.push_back(i);
+    }
+
+    std::mt19937 rng(12345);
+
+    std::shuffle(
+        shuffled_ids.begin(),
+        shuffled_ids.end(),
+        rng
+    );
+
+    MemoryIndex shuffled;
+
+    for (std::uint64_t id : shuffled_ids) {
+        REQUIRE(shuffled.insert(make_record(id)));
+    }
+
+    CHECK_EQ(shuffled.size(), 1000U);
+
+    std::printf(
+        "BST shuffled height (1000 nodes): %zu\n",
+        shuffled.height()
+    );
+
+    CHECK(shuffled.height() < sequential.height());
+}
+
+TEST(ctx_protected_and_over_budget) {
+    // case A: tool results get dropped first
+    std::vector<ContextItem> items_a{
+        {Role::System, 10, false},
+        {Role::Tool, 10, false},
+        {Role::Assistant, 10, false},
+        {Role::User, 10, false},
+        {Role::User, 10, false}
+    };
+
+    ContextPlan plan_a = select_context(items_a, 40, 1);
+
+    std::vector<std::size_t> expected_a{
+        0, 2, 3, 4
+    };
+
+    CHECK_EQ(plan_a.keep, expected_a);
+    CHECK_EQ(plan_a.total_tokens, 40U);
+    CHECK(!plan_a.over_budget);
+
+    // case B: pinned messages stay
+    // and the oldest assistant message gets dropped first
+    std::vector<ContextItem> items_b{
+        {Role::User, 10, true},
+        {Role::Assistant, 10, false},
+        {Role::Assistant, 10, false},
+        {Role::User, 10, false}
+    };
+
+    ContextPlan plan_b = select_context(items_b, 30, 1);
+
+    std::vector<std::size_t> expected_b{
+        0, 2, 3
+    };
+
+    CHECK_EQ(plan_b.keep, expected_b);
+    CHECK_EQ(plan_b.total_tokens, 30U);
+    CHECK(!plan_b.over_budget);
+
+    // case C: protected stuff alone is over the budget
+    std::vector<ContextItem> items_c{
+        {Role::System, 50, false},
+        {Role::User, 50, false}
+    };
+
+    ContextPlan plan_c = select_context(items_c, 60, 1);
+
+    std::vector<std::size_t> expected_c{
+        0, 1
+    };
+
+    CHECK_EQ(plan_c.keep, expected_c);
+    CHECK_EQ(plan_c.total_tokens, 100U);
+    CHECK(plan_c.over_budget);
+
+    // case D: everything already fits
+    std::vector<ContextItem> items_d{
+        {Role::System, 10, false},
+        {Role::Tool, 10, false},
+        {Role::Assistant, 10, false},
+        {Role::User, 10, false}
+    };
+
+    ContextPlan plan_d = select_context(items_d, 100, 1);
+
+    std::vector<std::size_t> expected_d{
+        0, 1, 2, 3
+    };
+
+    CHECK_EQ(plan_d.keep, expected_d);
+    CHECK_EQ(plan_d.total_tokens, 40U);
+    CHECK(!plan_d.over_budget);
 }
 
 // =========================================================================
