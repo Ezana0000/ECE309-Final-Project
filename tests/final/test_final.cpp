@@ -578,6 +578,408 @@ TEST(pol_chain_first_deny_stops_first_ask_wins) {
     CHECK_EQ(after_ptr->calls, 0);     // never evaluated: the chain stopped at the Deny
 }
 
+TEST(pol_allowlist_and_patterns) {
+    AllowlistPolicy allowlist({"ls", "cat"});
+
+    CommandRequest ls{"ls", {"-l"}, "test1"};
+    CommandRequest rm{"rm", {"file.txt"}, "test2"};
+
+    Decision allowed = allowlist.evaluate(ls);
+    Decision denied = allowlist.evaluate(rm);
+
+    CHECK(allowed.kind ==
+          Decision::allow("ok", "test").kind);
+
+    CHECK(denied.kind ==
+          Decision::deny("blocked", "test").kind);
+
+    CHECK_EQ(allowed.policy, std::string("allowlist"));
+    CHECK_EQ(denied.policy, std::string("allowlist"));
+
+    CHECK(!allowed.reason.empty());
+    CHECK(!denied.reason.empty());
+
+    // Empty patterns must be ignored.
+    ArgumentPatternPolicy patterns({
+        ";",
+        "rm -rf",
+        ""
+    });
+
+    CommandRequest semicolon{
+        "cat", {"a;", "rm", "b"}, "test3"
+    };
+
+    CommandRequest recursive_remove{
+        "rm", {"-rf", "/"}, "test4"
+    };
+
+    CommandRequest safe{
+        "ls", {"-l"}, "test5"
+    };
+
+    Decision d1 = patterns.evaluate(semicolon);
+    Decision d2 = patterns.evaluate(recursive_remove);
+    Decision d3 = patterns.evaluate(safe);
+
+    CHECK(d1.kind ==
+          Decision::deny("blocked", "test").kind);
+
+    CHECK(d2.kind ==
+          Decision::deny("blocked", "test").kind);
+
+    CHECK(d3.kind ==
+          Decision::allow("ok", "test").kind);
+
+    CHECK_EQ(d1.policy, std::string("patterns"));
+    CHECK_EQ(d2.policy, std::string("patterns"));
+
+    CHECK(!d1.reason.empty());
+    CHECK(!d2.reason.empty());
+    CHECK(!d3.reason.empty());
+}
+
+TEST(pol_confirm_and_ratelimit_zero) {
+    ConfirmPolicy confirm({"git"});
+
+    CommandRequest git{
+        "git", {"status"}, "test1"
+    };
+
+    CommandRequest ls{
+        "ls", {"-l"}, "test2"
+    };
+
+    Decision ask = confirm.evaluate(git);
+    Decision allow = confirm.evaluate(ls);
+
+    CHECK(ask.kind ==
+          Decision::ask("confirm", "test").kind);
+
+    CHECK(allow.kind ==
+          Decision::allow("ok", "test").kind);
+
+    CHECK_EQ(ask.policy, std::string("confirm"));
+    CHECK(!ask.reason.empty());
+    CHECK(!allow.reason.empty());
+
+    // Capacity zero must deny everything.
+    ManualClock clock;
+
+    RateLimitPolicy zero(0, 60.0, clock);
+
+    for (int i = 0; i < 5; ++i) {
+        Decision result = zero.evaluate(ls);
+
+        CHECK(result.kind ==
+              Decision::deny("blocked", "test").kind);
+    }
+
+    CHECK_EQ(zero.tracked(), 0U);
+
+    // Only three of ten requests should be allowed.
+    RateLimitPolicy limited(3, 60.0, clock);
+
+    int allowed_count = 0;
+    int denied_count = 0;
+
+    for (int i = 0; i < 10; ++i) {
+        Decision result = limited.evaluate(ls);
+
+        if (result.kind ==
+            Decision::allow("ok", "test").kind) {
+            ++allowed_count;
+        } else {
+            ++denied_count;
+        }
+
+        CHECK(limited.tracked() <= 3U);
+    }
+
+    CHECK_EQ(allowed_count, 3);
+    CHECK_EQ(denied_count, 7);
+    CHECK_EQ(limited.tracked(), 3U);
+}
+
+TEST(pol_chain_empty_and_nested) {
+    CommandRequest req{
+        "rm", {"file.txt"}, "test1"
+    };
+
+    PolicyChain empty;
+
+    Decision empty_result = empty.evaluate(req);
+
+    CHECK(empty_result.kind ==
+          Decision::deny("blocked", "test").kind);
+
+    CHECK_EQ(
+        empty_result.policy,
+        std::string("chain")
+    );
+
+    CHECK(!empty_result.reason.empty());
+
+    // Null children must not be added.
+    CHECK(!empty.add(nullptr));
+    CHECK_EQ(empty.size(), 0U);
+
+    // A named child policy that always denies.
+    // This tests that nesting preserves the leaf policy.
+    struct InnerDenyPolicy : Policy {
+        auto name() const
+            -> decltype(std::declval<const Policy&>().name())
+            override {
+            return "inner";
+        }
+
+        Decision evaluate(
+            const CommandRequest&) override {
+
+            return Decision::deny(
+                "denied by inner policy",
+                name()
+            );
+        }
+    };
+
+    auto inner = std::make_unique<PolicyChain>();
+
+    CHECK(inner->add(
+        std::make_unique<InnerDenyPolicy>()
+    ));
+
+    PolicyChain outer;
+
+    // The first child allows "rm".
+    CHECK(outer.add(
+        std::make_unique<AllowlistPolicy>(
+            std::vector<std::string>{"rm"}
+        )
+    ));
+
+    // The second child is the nested denying chain.
+    CHECK(outer.add(std::move(inner)));
+
+    Decision nested_result = outer.evaluate(req);
+
+    CHECK(nested_result.kind ==
+          Decision::deny("blocked", "test").kind);
+
+    CHECK_EQ(
+        nested_result.policy,
+        std::string("inner")
+    );
+
+    CHECK_EQ(outer.size(), 2U);
+
+    // A chain of Allow decisions should Allow.
+    PolicyChain all_allow;
+
+    CHECK(all_allow.add(
+        std::make_unique<AllowlistPolicy>(
+            std::vector<std::string>{"rm"}
+        )
+    ));
+
+    CHECK(all_allow.add(
+        std::make_unique<ConfirmPolicy>(
+            std::vector<std::string>{"git"}
+        )
+    ));
+
+    Decision allow_result = all_allow.evaluate(req);
+
+    CHECK(allow_result.kind ==
+          Decision::allow("ok", "test").kind);
+
+    CHECK_EQ(
+        allow_result.policy,
+        std::string("chain")
+    );
+
+    CHECK(!allow_result.reason.empty());
+}
+
+TEST(index_postings_once_per_doc) {
+    SkillIndex index;
+
+    index.add(0, "table table format");
+    index.add(1, "table csv");
+
+    const auto* table = index.postings("table");
+
+    REQUIRE(table != nullptr);
+
+    std::vector<std::size_t> expected{
+        0, 1
+    };
+
+    CHECK_EQ(*table, expected);
+
+    // Each document is added once per distinct word.
+    CHECK_EQ(table->size(), 2U);
+
+    const auto* format = index.postings("format");
+
+    REQUIRE(format != nullptr);
+    CHECK_EQ(format->size(), 1U);
+    CHECK_EQ(format->at(0), 0U);
+
+    const auto* csv = index.postings("csv");
+
+    REQUIRE(csv != nullptr);
+    CHECK_EQ(csv->size(), 1U);
+    CHECK_EQ(csv->at(0), 1U);
+
+    CHECK(index.postings("nope") == nullptr);
+
+    CHECK_EQ(index.word_count(), 3U);
+
+    // Verify score ranking and smaller ID on a tie.
+    std::vector<std::size_t> expected_search{
+        0, 1
+    };
+
+    CHECK_EQ(
+        index.search("table format", 5),
+        expected_search
+    );
+
+    CHECK_EQ(
+        index.search("table", 5),
+        expected_search
+    );
+}
+
+TEST(index_empty_and_timing) {
+    SkillIndex empty_index;
+
+    CHECK(empty_index.search("", 5).empty());
+    CHECK(empty_index.search("zzz", 5).empty());
+    CHECK(empty_index.search("table", 0).empty());
+
+    const std::vector<std::string> words{
+        "table",
+        "csv",
+        "format",
+        "report",
+        "data",
+        "memory",
+        "graph",
+        "search",
+        "index",
+        "cache",
+        "policy",
+        "skill"
+    };
+
+    const std::vector<std::size_t> sizes{
+        100, 1000, 5000
+    };
+
+    for (std::size_t n : sizes) {
+        std::mt19937 rng(
+            static_cast<std::mt19937::result_type>(
+                12345 + n
+            )
+        );
+
+        std::uniform_int_distribution<std::size_t> dist(
+            0, words.size() - 1
+        );
+
+        SkillIndex index;
+        std::vector<std::string> docs;
+        docs.reserve(n);
+
+        // Generate and index N fake documents.
+        for (std::size_t id = 0; id < n; ++id) {
+            std::string text;
+
+            for (int j = 0; j < 8; ++j) {
+                if (!text.empty()) {
+                    text += " ";
+                }
+
+                text += words[dist(rng)];
+            }
+
+            docs.push_back(text);
+            index.add(id, text);
+        }
+
+        // Generate 200 deterministic queries.
+        std::vector<std::string> queries;
+        queries.reserve(200);
+
+        for (int q = 0; q < 200; ++q) {
+            std::string query =
+                words[dist(rng)] + " " +
+                words[dist(rng)];
+
+            queries.push_back(query);
+        }
+
+        std::vector<std::vector<std::size_t>> index_results;
+        std::vector<std::vector<std::size_t>> linear_results;
+
+        index_results.reserve(queries.size());
+        linear_results.reserve(queries.size());
+
+        // Time the inverted-index searches.
+        auto index_start =
+            std::chrono::steady_clock::now();
+
+        for (const auto& query : queries) {
+            index_results.push_back(
+                index.search(query, 5)
+            );
+        }
+
+        auto index_end =
+            std::chrono::steady_clock::now();
+
+        // Time the provided linear-search baseline.
+        auto linear_start =
+            std::chrono::steady_clock::now();
+
+        for (const auto& query : queries) {
+            linear_results.push_back(
+                linear_search(docs, query, 5)
+            );
+        }
+
+        auto linear_end =
+            std::chrono::steady_clock::now();
+
+        // Both algorithms must return identical results.
+        CHECK_EQ(index_results.size(), linear_results.size());
+
+        for (std::size_t i = 0; i < queries.size(); ++i) {
+            CHECK_EQ(index_results[i], linear_results[i]);
+        }
+
+        const double index_ms =
+            std::chrono::duration<double, std::milli>(
+                index_end - index_start
+            ).count() / queries.size();
+
+        const double linear_ms =
+            std::chrono::duration<double, std::milli>(
+                linear_end - linear_start
+            ).count() / queries.size();
+
+        std::printf(
+            "N=%zu | index=%.6f ms/query | "
+            "linear=%.6f ms/query\n",
+            n,
+            index_ms,
+            linear_ms
+        );
+    }
+}
+
 // =========================================================================
 // Skills — 2 examples
 // =========================================================================

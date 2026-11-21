@@ -1,70 +1,132 @@
-// src/policy/policies.cpp — YOU IMPLEMENT. Spec §5.2.
-
 #include "policy/policies.h"
 
+#include <string>
 #include <utility>
+#include <vector>
 
-AllowlistPolicy::AllowlistPolicy(const std::vector<std::string>& programs) {
-    // TODO: copy the names into programs_ (an std::unordered_set).
-    // Clue: sets use insert(x), not push_back(x). One-liner: in the member
-    // initializer list,  programs_(programs.begin(), programs.end()).
-    (void)programs;
+// Build the allowlist from the provided programs.
+AllowlistPolicy::AllowlistPolicy(
+    const std::vector<std::string>& programs) {
+
+    for (const auto& program : programs) {
+        programs_.insert(program);
+    }
 }
 
-Decision AllowlistPolicy::evaluate(const CommandRequest& req) {
-    // TODO
-    // Clue: test membership with  programs_.count(x) > 0  or
-    // programs_.find(x) != programs_.end().  (contains() is C++20; this
-    // project is C++17.)  Build results with Decision::allow(reason, name())
-    // and Decision::deny(reason, name()). Any non-empty reason is fine;
-    // naming the program ("'rm' is not on the allowlist") helps the user.
-    (void)req;
-    return Decision::deny("not implemented", name());
+Decision AllowlistPolicy::evaluate(
+    const CommandRequest& req) {
+
+    if (programs_.find(req.program) != programs_.end()) {
+        return Decision::allow(
+            "program is on the allowlist",
+            name()
+        );
+    }
+
+    return Decision::deny(
+        "'" + req.program + "' is not on the allowlist",
+        name()
+    );
 }
 
-ArgumentPatternPolicy::ArgumentPatternPolicy(std::vector<std::string> patterns)
+// Store the argument patterns.
+ArgumentPatternPolicy::ArgumentPatternPolicy(
+    std::vector<std::string> patterns)
     : patterns_(std::move(patterns)) {}
 
-Decision ArgumentPatternPolicy::evaluate(const CommandRequest& req) {
-    // TODO: search req.command_line() for each pattern.
-    // Clue: std::string::find returns std::string::npos when it finds
-    // nothing, NOT 0 or false. "if (line.find(p))" is true for almost
-    // everything. Compare with npos.
-    // Clue: skip empty patterns: every string "contains" the empty string.
+// Reject commands containing forbidden patterns.
+Decision ArgumentPatternPolicy::evaluate(
+    const CommandRequest& req) {
+
+    const std::string command = req.command_line();
+
+    for (const auto& pattern : patterns_) {
+
+        if (pattern.empty()) {
+            continue;
+        }
+
+        if (command.find(pattern) != std::string::npos) {
+            return Decision::deny(
+                "command contains forbidden pattern \"" +
+                pattern + "\"",
+                name()
+            );
+        }
+    }
+
+    return Decision::allow(
+        "no forbidden patterns found",
+        name()
+    );
+}
+
+// Build the confirmation list.
+ConfirmPolicy::ConfirmPolicy(
+    const std::vector<std::string>& programs) {
+
+    for (const auto& program : programs) {
+        programs_.insert(program);
+    }
+}
+
+// Ask for confirmation only for listed programs.
+Decision ConfirmPolicy::evaluate(
+    const CommandRequest& req) {
+
+    if (programs_.find(req.program) != programs_.end()) {
+        return Decision::ask(
+            "program needs confirmation",
+            name()
+        );
+    }
+
+    return Decision::allow(
+        "program does not require confirmation",
+        name()
+    );
+}
+
+// Initialize the sliding-window rate limiter.
+RateLimitPolicy::RateLimitPolicy(
+    std::size_t max,
+    double window,
+    const Clock& clock)
+    : max_(max),
+      window_(window),
+      clock_(clock) {}
+
+// Allow at most max_ requests during the time window.
+Decision RateLimitPolicy::evaluate(
+    const CommandRequest& req) {
+
     (void)req;
-    return Decision::deny("not implemented", name());
+
+    const double t = clock_.now_seconds();
+
+    // Remove timestamps that are outside the window.
+    while (!times_.empty() &&
+           t - times_.front() >= window_) {
+        times_.pop();
+    }
+
+    // Denied requests are never recorded.
+    if (times_.size() >= max_) {
+        return Decision::deny(
+            "rate limit exceeded",
+            name()
+        );
+    }
+
+    times_.push(t);
+
+    return Decision::allow(
+        "request is within the rate limit",
+        name()
+    );
 }
 
-ConfirmPolicy::ConfirmPolicy(const std::vector<std::string>& programs) {
-    // TODO
-    (void)programs;
+// Number of requests currently tracked.
+std::size_t RateLimitPolicy::tracked() const noexcept {
+    return times_.size();
 }
-
-Decision ConfirmPolicy::evaluate(const CommandRequest& req) {
-    // TODO: Decision::ask(...) for listed programs, Decision::allow(...) otherwise.
-    (void)req;
-    return Decision::deny("not implemented", name());
-}
-
-RateLimitPolicy::RateLimitPolicy(std::size_t max_commands, double window_seconds, const Clock& clock)
-    : max_(max_commands), window_(window_seconds), clock_(clock) {}
-
-Decision RateLimitPolicy::evaluate(const CommandRequest& req) {
-    // TODO: drop timestamps that left the window, then decide.
-    // Clues, in order:
-    //  1. now = clock_.now_seconds().
-    //  2. While the queue is NOT empty and its front timestamp has left the
-    //     window, pop it. A timestamp s is still INSIDE when now - s < window_,
-    //     so it has left when now - s >= window_ (exactly window_ seconds old
-    //     counts as gone). Calling front() on an empty queue is undefined
-    //     behavior (UBSan says "misaligned address"): check empty() first.
-    //  3. If the queue already holds max_ timestamps: Deny, and do NOT push.
-    //  4. Otherwise push(now) and Allow. Only allowed requests are recorded.
-    (void)req;
-    (void)max_;
-    (void)window_;
-    (void)clock_;
-    return Decision::deny("not implemented", name());
-}
-
-std::size_t RateLimitPolicy::tracked() const noexcept { return times_.size(); }
